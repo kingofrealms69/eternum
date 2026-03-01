@@ -24,6 +24,17 @@ function createFailingAccount(error: string) {
   } as any;
 }
 
+function createMockAccountWithReceipt(
+  receipt: Record<string, unknown>,
+  txHash = "0xdeadbeef",
+) {
+  return {
+    execute: vi.fn().mockResolvedValue({ transaction_hash: txHash }),
+    waitForTransaction: vi.fn().mockResolvedValue(receipt),
+    address: "0x1234",
+  } as any;
+}
+
 // ABI param names from the real manifest (not the action-registry's renamed versions)
 const CREATE_GUILD_PARAMS = { public: true, name: "TestGuild" };
 const BUY_PARAMS = { bank_entity_id: 1, structure_id: 42, resource_type: 1, amount: 100n };
@@ -75,6 +86,25 @@ describe("createABIExecutor", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toBeTruthy();
+  });
+
+  it("returns error when receipt is reverted after successful submission", async () => {
+    const { routes } = generateActions(manifest);
+    const account = createMockAccountWithReceipt({
+      execution_status: "REVERTED",
+      revert_reason: "tile is already explored",
+    }, "0xreverted");
+    const executor = createABIExecutor(manifest, account, { routes });
+
+    const result = await executor.execute({
+      type: "explorer_move",
+      params: { explorer_id: 42, directions: [0], explore: true },
+    });
+
+    expect(account.waitForTransaction).toHaveBeenCalledWith("0xreverted");
+    expect(result.success).toBe(false);
+    expect(result.txHash).toBe("0xreverted");
+    expect(result.error).toContain("tile is already explored");
   });
 
   it("runs preflight validation from overlay", async () => {

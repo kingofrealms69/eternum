@@ -161,6 +161,72 @@ function extractErrorMessage(err: any): string {
   return firstLine;
 }
 
+function classifyFailure(message: string): { reasonCode: string; retryable: boolean } {
+  const msg = message.toLowerCase();
+  if (
+    msg.includes("timeout") ||
+    msg.includes("temporar") ||
+    msg.includes("network") ||
+    msg.includes("fetch failed") ||
+    msg.includes("connection") ||
+    msg.includes("rate limit")
+  ) {
+    return { reasonCode: "TRANSPORT_ERROR", retryable: true };
+  }
+  if (msg.includes("revert") || msg.includes("already explored") || msg.includes("occupied")) {
+    return { reasonCode: "REVERTED_DETERMINISTIC", retryable: false };
+  }
+  return { reasonCode: "ACTION_FAILED", retryable: false };
+}
+
+type WaitableAccount = Account & {
+  waitForTransaction?: (txHash: string, options?: Record<string, unknown>) => Promise<unknown>;
+  provider?: {
+    waitForTransaction?: (txHash: string, options?: Record<string, unknown>) => Promise<unknown>;
+  };
+};
+
+function getTxHash(result: unknown): string | undefined {
+  const r = result as any;
+  return r?.transaction_hash ?? r?.transactionHash ?? undefined;
+}
+
+function isReceiptReverted(receipt: unknown): boolean {
+  const r = receipt as any;
+  if (typeof r?.isReverted === "function") {
+    try {
+      return Boolean(r.isReverted());
+    } catch {}
+  }
+  const executionStatus = String(r?.execution_status ?? r?.executionStatus ?? "").toUpperCase();
+  if (executionStatus === "REVERTED" || executionStatus === "REJECTED") return true;
+  const finalityStatus = String(r?.finality_status ?? r?.finalityStatus ?? "").toUpperCase();
+  return finalityStatus === "REJECTED";
+}
+
+function extractReceiptRevertReason(receipt: unknown): string | undefined {
+  const r = receipt as any;
+  const reason =
+    r?.revert_reason ??
+    r?.revertReason ??
+    r?.revert_error ??
+    r?.revertError ??
+    r?.reason;
+  if (typeof reason === "string" && reason.trim().length > 0) return reason.trim();
+  return undefined;
+}
+
+async function waitForReceiptIfSupported(account: WaitableAccount, txHash: string): Promise<unknown | undefined> {
+  if (typeof account.waitForTransaction === "function") {
+    return await account.waitForTransaction(txHash);
+  }
+  const providerWait = account.provider?.waitForTransaction;
+  if (typeof providerWait === "function") {
+    return await providerWait.call(account.provider, txHash, { retryInterval: 500 });
+  }
+  return undefined;
+}
+
 // ── Debug logging ───────────────────────────────────────────────────────────
 
 function debugLogCoercion(
@@ -231,7 +297,12 @@ export function createABIExecutor(manifest: Manifest, account: Account, options:
       const cachedState = cachedStateProvider?.();
       const preflightError = route.overlay.preflight(action.params, cachedState);
       if (preflightError) {
-        return { success: false, error: preflightError };
+        return {
+          success: false,
+          error: preflightError,
+          reasonCode: "PRECHECK_FAILED",
+          retryable: false,
+        };
       }
     }
 
@@ -283,24 +354,55 @@ export function createABIExecutor(manifest: Manifest, account: Account, options:
       const call: Call = {
         contractAddress: route.contractAddress,
         entrypoint: route.entrypoint,
-        calldata: CallData.compile(positionalArgs),
+        calldata: CallData.compile(positionalArgs as any),
       };
       const result = await account.execute(call);
-      const txHash = result?.transaction_hash ?? (result as any)?.transactionHash ?? undefined;
+      const txHash = getTxHash(result);
+
+      if (!txHash) {
+        const actionResult: ActionResult = {
+          success: false,
+          error: "Transaction submitted but no transaction hash was returned by signer.",
+          reasonCode: "MISSING_TX_HASH",
+          retryable: true,
+        };
+        onAfterExecute?.(action.type, actionResult);
+        return actionResult;
+      }
+
+      const receipt = await waitForReceiptIfSupported(account as WaitableAccount, txHash);
+      if (receipt && isReceiptReverted(receipt)) {
+        const reason = extractReceiptRevertReason(receipt) ?? "Unknown revert reason";
+        const actionResult: ActionResult = {
+          success: false,
+          txHash,
+          error: `Transaction reverted: ${reason}`,
+          reasonCode: "REVERTED_ONCHAIN",
+          retryable: false,
+        };
+        onAfterExecute?.(action.type, actionResult);
+        return actionResult;
+      }
 
       const actionResult: ActionResult = {
         success: true,
         txHash,
         data: txHash ? { transactionHash: txHash } : undefined,
+        reasonCode: "OK",
+        retryable: false,
       };
 
       onAfterExecute?.(action.type, actionResult);
       return actionResult;
     } catch (err: any) {
       debugLogError(action.type, err);
+      const message = extractErrorMessage(err);
+      const { reasonCode, retryable } = classifyFailure(message);
       const actionResult: ActionResult = {
         success: false,
-        error: extractErrorMessage(err),
+        error: message,
+        reasonCode,
+        retryable,
       };
 
       onAfterExecute?.(action.type, actionResult);

@@ -458,4 +458,18 @@ describe("pre-flight: explorer_move", () => {
     expect(result).toContain("stamina");
     expect(result).toContain("10");
   });
+
+  it("fails when target tile is already explored", () => {
+    const state = {
+      entities: [
+        { entityId: 1, type: "army", isOwned: true, stamina: 60, position: { x: 10, y: 10 } },
+      ],
+      tileMap: new Map([
+        ["11,10", { biome: 3, occupierType: 0, occupierId: 0 }],
+      ]),
+    };
+
+    const result = preflight({ explore: true, explorer_id: 1, directions: [0] }, state);
+    expect(result).toContain("already explored");
+  });
 });

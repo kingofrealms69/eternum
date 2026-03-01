@@ -11,6 +11,7 @@
  */
 import type { DomainOverlayMap, Manifest } from "./types";
 import { extractAllFromManifest, getGameEntrypoints } from "./parser";
+import { getNeighborHexes } from "@bibliothecadao/types";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -260,6 +261,31 @@ function preflightExplorerMove(params: Record<string, unknown>, cachedState?: un
   if (explorer?.stamina !== undefined && explorer.stamina < staminaNeeded) {
     return `Explorer has ${explorer.stamina} stamina, need ${staminaNeeded} to explore. Use explore=false for traveled tiles (10 stamina/hex). Wait for regen (+20/min).`;
   }
+
+  // Explore should be a single adjacent step; multi-step movement belongs to travel/move_to.
+  if (dirs.length !== 1) {
+    return "Explore requires exactly one direction. Use explore=false (travel) or move_to for multi-step movement.";
+  }
+
+  // If world-state tile data is present, prevent known-invalid explores up front.
+  if (explorer?.position?.x != null && explorer?.position?.y != null && state.tileMap) {
+    const direction = Number(dirs[0]);
+    const neighbor = getNeighborHexes(Number(explorer.position.x), Number(explorer.position.y)).find(
+      (n) => Number(n.direction) === direction,
+    );
+    if (neighbor) {
+      const key = `${neighbor.col},${neighbor.row}`;
+      const tile = state.tileMap instanceof Map ? state.tileMap.get(key) : (state.tileMap as Record<string, any>)[key];
+      if (tile) {
+        if (Number(tile.biome ?? 0) > 0) {
+          return `Target tile (${neighbor.col},${neighbor.row}) is already explored. Use explore=false for travel on explored tiles.`;
+        }
+        if (Number(tile.occupierType ?? 0) !== 0) {
+          return `Target tile (${neighbor.col},${neighbor.row}) is occupied. Choose a different direction.`;
+        }
+      }
+    }
+  }
   return null;
 }
 
@@ -499,7 +525,7 @@ export const ETERNUM_OVERLAYS: DomainOverlayMap = {
     description:
       "Move an explorer along hex directions. With explore=false: multi-hex travel through explored tiles (~10 stamina/hex). " +
       "With explore=true: single-hex exploration of an unrevealed tile (30 stamina, min 10 troops, awards VP).",
-    aliases: ["travel_explorer", "explore"],
+    aliases: ["travel_explorer"],
     paramOverrides: {
       explorer_id: { description: "Explorer entity ID" },
       directions: { description: `Array of hex directions (${DIR})` },

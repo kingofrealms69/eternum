@@ -59,6 +59,8 @@ export interface ActionResult {
   txHash?: string;
   data?: unknown;
   error?: string;
+  reasonCode?: string;
+  retryable?: boolean;
 }
 
 /**

@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { executeAction, getActionHandler, getAvailableActions } from "../../src/adapter/action-registry";
+import {
+  executeAction,
+  getActionHandler,
+  getAvailableActions,
+  initializeActions,
+  setCachedWorldState,
+} from "../../src/adapter/action-registry";
 import { createMockClient, mockSigner } from "../utils/mock-client";
-import { initializeTestActionRegistry } from "../utils/init-action-registry";
+import { initializeTestActionRegistry, testManifest } from "../utils/init-action-registry";
 
 describe("action-registry (ABI executor)", () => {
   let client: ReturnType<typeof createMockClient>;
@@ -11,12 +17,14 @@ describe("action-registry (ABI executor)", () => {
     client = createMockClient();
     vi.mocked(mockSigner.execute).mockReset();
     vi.mocked(mockSigner.execute).mockResolvedValue({ transaction_hash: "0xabc123" });
+    delete (mockSigner as any).callContract;
   });
 
   it("lists current action types including aliases and composites", () => {
     const actions = getAvailableActions();
     expect(actions).toContain("send_resources");
     expect(actions).toContain("move_explorer");
+    expect(actions).toContain("explore");
     expect(actions).toContain("create_trade");
     expect(actions).toContain("approve_token");
     expect(actions).toContain("lock_entry_token");
@@ -56,19 +64,57 @@ describe("action-registry (ABI executor)", () => {
     expect(call.entrypoint).toBe("send");
   });
 
-  it("executes move_explorer with current snake_case schema", async () => {
+  it("routes legacy move_explorer explore=true through explore multicall", async () => {
     const result = await executeAction(client as any, mockSigner, {
       type: "move_explorer",
       params: {
         explorer_id: 42,
-        directions: [1, 2, 3],
+        directions: [1],
         explore: true,
       },
     });
 
     expect(result.success).toBe(true);
-    const call = vi.mocked(mockSigner.execute).mock.calls[0][0] as any;
-    expect(call.entrypoint).toBe("explorer_move");
+    const call = vi.mocked(mockSigner.execute).mock.calls[0][0] as any[];
+    expect(Array.isArray(call)).toBe(true);
+    expect(call[0].entrypoint).toBe("request_random");
+    expect(call[1].entrypoint).toBe("explorer_move");
+  });
+
+  it("executes explore composite action", async () => {
+    const result = await executeAction(client as any, mockSigner, {
+      type: "explore",
+      params: {
+        explorer_id: 42,
+        direction: 0,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const call = vi.mocked(mockSigner.execute).mock.calls[0][0] as any[];
+    expect(Array.isArray(call)).toBe(true);
+    expect(call[1].entrypoint).toBe("explorer_move");
+  });
+
+  it("skips explorer_extract_reward call when reward route is missing", async () => {
+    const manifestWithoutReward = JSON.parse(JSON.stringify(testManifest));
+    for (const contract of manifestWithoutReward.contracts ?? []) {
+      if (!Array.isArray(contract?.abi)) continue;
+      contract.abi = contract.abi.filter((item: any) => item?.name !== "explorer_extract_reward");
+    }
+    initializeActions(manifestWithoutReward, mockSigner, { gameName: "eternum" });
+
+    const result = await executeAction(client as any, mockSigner, {
+      type: "explore",
+      params: {
+        explorer_id: 42,
+        direction: 0,
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const call = vi.mocked(mockSigner.execute).mock.calls[0][0] as any[];
+    expect(call.some((c) => c.entrypoint === "explorer_extract_reward")).toBe(false);
   });
 
   it("executes create_trade alias through create_order route", async () => {
@@ -116,5 +162,78 @@ describe("action-registry (ABI executor)", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toBe("tx reverted");
+  });
+
+  it("auto-discovers token_id and defaults lock_id=69 for lock_entry_token", async () => {
+    const callContract = vi.fn()
+      // balance_of(owner) -> 2
+      .mockResolvedValueOnce(["2", "0"])
+      // token_of_owner_by_index(owner, 1) -> token_id 123
+      .mockResolvedValueOnce(["123", "0"]);
+    (mockSigner as any).callContract = callContract;
+
+    const result = await executeAction(client as any, mockSigner, {
+      type: "lock_entry_token",
+      params: { token_address: "0xentry" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(callContract).toHaveBeenCalledTimes(2);
+    const txCall = vi.mocked(mockSigner.execute).mock.calls[0][0] as any;
+    expect(txCall.entrypoint).toBe("token_lock");
+    expect(txCall.calldata[0]).toBe("123");
+    expect(txCall.calldata[1]).toBe("0");
+    expect(txCall.calldata[2]).toBe("69");
+  });
+
+  it("fails lock_entry_token when auto-discovery finds no tokens", async () => {
+    const callContract = vi.fn()
+      // balance_of(owner) -> 0
+      .mockResolvedValueOnce(["0", "0"]);
+    (mockSigner as any).callContract = callContract;
+
+    const result = await executeAction(client as any, mockSigner, {
+      type: "lock_entry_token",
+      params: { token_address: "0xentry" },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("No entry tokens found");
+    expect(mockSigner.execute).not.toHaveBeenCalled();
+  });
+
+  it("blocks immediate deterministic repeats for unchanged state", async () => {
+    setCachedWorldState({
+      tick: 1,
+      timestamp: 1000,
+      entities: [],
+      tileMap: new Map(),
+    } as any);
+
+    vi.mocked(mockSigner.execute).mockRejectedValue(new Error("execution reverted: tile is already explored"));
+
+    const first = await executeAction(client as any, mockSigner, {
+      type: "move_explorer",
+      params: {
+        explorer_id: 42,
+        directions: [0],
+        explore: true,
+      },
+    });
+
+    const second = await executeAction(client as any, mockSigner, {
+      type: "move_explorer",
+      params: {
+        explorer_id: 42,
+        directions: [0],
+        explore: true,
+      },
+    });
+
+    expect(first.success).toBe(false);
+    expect(first.reasonCode).toBeDefined();
+    expect(second.success).toBe(false);
+    expect(second.reasonCode).toBe("DETERMINISTIC_REPEAT_BLOCKED");
+    expect(vi.mocked(mockSigner.execute)).toHaveBeenCalledTimes(1);
   });
 });
